@@ -22,8 +22,30 @@ import {
   buildFriendlySignals,
   buildHotExplanation,
   buildNotHotExplanation,
-  isHighScoreRecord,
 } from "@/lib/caller-prep";
+import { LushaContacts } from "@/components/LushaContacts";
+
+// ---------- Industry grouping (deterministic keyword match) ----------
+const INDUSTRY_GROUPS: { group: string; keywords: string[] }[] = [
+  { group: "Technology", keywords: ["software", "saas", "tech", "it ", "information technology", "internet", "computer", "data", "cloud", "cyber", "ai", "digital"] },
+  { group: "Manufacturing", keywords: ["manufactur", "industrial", "machinery", "automotive", "aerospace", "chemical", "plastics", "steel", "factory"] },
+  { group: "Logistics & Transport", keywords: ["logistic", "transport", "shipping", "freight", "supply chain", "warehous", "maritime", "aviation", "airline", "rail"] },
+  { group: "Healthcare", keywords: ["health", "pharma", "biotech", "medical", "hospital", "life science", "clinical"] },
+  { group: "Finance", keywords: ["financ", "bank", "insur", "invest", "capital", "asset manag", "fintech", "accounting"] },
+  { group: "Retail & Consumer", keywords: ["retail", "consumer", "e-commerce", "ecommerce", "fashion", "apparel", "food", "beverage", "hospitality", "restaurant", "wholesale"] },
+  { group: "Education & Training", keywords: ["educat", "training", "school", "university", "academ", "e-learning", "elearning"] },
+  { group: "Professional Services", keywords: ["consult", "legal", "law ", "advisory", "marketing", "advertis", "agency", "human resources", "recruit", "staffing", "professional service"] },
+  { group: "Energy & Utilities", keywords: ["energy", "oil", "gas", "utility", "utilities", "power", "renewable", "mining", "water"] },
+];
+
+function industryGroupOf(industry: string): string {
+  const s = (industry || "").toLowerCase();
+  if (!s) return "";
+  for (const { group, keywords } of INDUSTRY_GROUPS) {
+    if (keywords.some((k) => s.includes(k))) return group;
+  }
+  return "Other";
+}
 
 export const Route = createFileRoute("/")({
   head: () => ({
@@ -210,12 +232,13 @@ function App() {
   const [filters, setFilters] = useState({
     tier: "all",
     readiness: "all",
-    country: "all",
-    industry: "all",
+    industryGroup: "all",
+    employeeRange: "all",
     sourceFile: "all",
     manualReview: false,
     competitor: false,
-    hideHighScore: true,
+    hasCallerAngle: false,
+    hasEvidence: false,
   });
   const [sortBy, setSortBy] = useState<"score" | "name" | "tier">("score");
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -271,18 +294,12 @@ function App() {
     }
   };
 
-  const hiddenHighScoreCount = useMemo(
-    () => merged.filter((m) => isHighScoreRecord(m.row)).length,
-    [merged],
-  );
-
   const filteredSortedRows = useMemo(() => {
     const q = search.trim().toLowerCase();
     let out = merged
       .map((m, i) => ({ m, i }))
       .filter(({ m }) => {
         const r = m.row;
-        if (filters.hideHighScore && isHighScoreRecord(r)) return false;
         if (q) {
           const name = val(r, "company_name").toLowerCase();
           const dom = val(r, "domain", "validated_domain", "canonical_company_domain").toLowerCase();
@@ -290,12 +307,14 @@ function App() {
         }
         if (filters.tier !== "all" && cleanTier(val(r, "commercial_tier")) !== filters.tier) return false;
         if (filters.readiness !== "all" && val(r, "outreach_readiness_status") !== filters.readiness) return false;
-        if (filters.country !== "all" && val(r, "country") !== filters.country) return false;
-        if (filters.industry !== "all" && val(r, "industry") !== filters.industry) return false;
+        if (filters.industryGroup !== "all" && industryGroupOf(val(r, "industry")) !== filters.industryGroup) return false;
+        if (filters.employeeRange !== "all" && val(r, "employee_range") !== filters.employeeRange) return false;
         if (filters.sourceFile !== "all" && !m.sourceFiles.includes(filters.sourceFile)) return false;
         if (filters.manualReview && !bool(r, "needs_manual_review")) return false;
         if (filters.competitor && !val(r, "competitor_provider_detected") && !val(r, "competitor_attention_provider_detected"))
           return false;
+        if (filters.hasCallerAngle && !val(r, "caller_angle")) return false;
+        if (filters.hasEvidence && buildKeyLinks(r).length === 0) return false;
         return true;
       });
     out.sort((a, b) => {
@@ -359,7 +378,6 @@ function App() {
             <Sidebar
               rows={filteredSortedRows}
               total={merged.length}
-              hiddenHighScoreCount={hiddenHighScoreCount}
               selectedIdx={selectedIdx}
               setSelectedIdx={setSelectedIdx}
               search={search}
@@ -495,7 +513,6 @@ function Landing({ onUpload }: { onUpload: () => void }) {
 function Sidebar({
   rows,
   total,
-  hiddenHighScoreCount,
   selectedIdx,
   setSelectedIdx,
   search,
@@ -509,18 +526,17 @@ function Sidebar({
 }: {
   rows: { m: MergedRow; i: number }[];
   total: number;
-  hiddenHighScoreCount: number;
   selectedIdx: number;
   setSelectedIdx: (i: number) => void;
   search: string;
   setSearch: (s: string) => void;
   filters: {
-    tier: string; readiness: string; country: string; industry: string; sourceFile: string;
-    manualReview: boolean; competitor: boolean; hideHighScore: boolean;
+    tier: string; readiness: string; industryGroup: string; employeeRange: string; sourceFile: string;
+    manualReview: boolean; competitor: boolean; hasCallerAngle: boolean; hasEvidence: boolean;
   };
   setFilters: React.Dispatch<React.SetStateAction<{
-    tier: string; readiness: string; country: string; industry: string; sourceFile: string;
-    manualReview: boolean; competitor: boolean; hideHighScore: boolean;
+    tier: string; readiness: string; industryGroup: string; employeeRange: string; sourceFile: string;
+    manualReview: boolean; competitor: boolean; hasCallerAngle: boolean; hasEvidence: boolean;
   }>>;
   sortBy: "score" | "name" | "tier";
   setSortBy: (s: "score" | "name" | "tier") => void;
@@ -528,20 +544,30 @@ function Sidebar({
   sourceFiles: string[];
 }) {
   const SelectFilter = ({
-    label, value, options, onChange,
-  }: { label: string; value: string; options: string[]; onChange: (v: string) => void }) => (
+    label, value, options, onChange, muted = false,
+  }: { label: string; value: string; options: string[]; onChange: (v: string) => void; muted?: boolean }) => (
     <label className="block">
-      <span className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-muted-foreground">{label}</span>
+      <span className={`mb-1 block text-[11px] font-medium uppercase tracking-wide ${muted ? "text-muted-foreground/70" : "text-muted-foreground"}`}>{label}</span>
       <select
         value={value}
         onChange={(e) => onChange(e.target.value)}
-        className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-sm"
+        className={`w-full rounded-md border bg-background px-2 py-1.5 text-sm ${muted ? "border-border/60 text-muted-foreground" : "border-border"}`}
       >
         <option value="all">All</option>
         {options.map((o) => <option key={o} value={o}>{o}</option>)}
       </select>
     </label>
   );
+
+  const industryGroupOptions = useMemo(() => {
+    const s = new Set<string>();
+    for (const { m } of rows) {
+      const g = industryGroupOf(val(m.row, "industry"));
+      if (g) s.add(g);
+    }
+    // Also include groups present across all loaded rows so options stay stable
+    return Array.from(s).sort();
+  }, [rows]);
 
   return (
     <div className="sticky top-[72px] max-h-[calc(100vh-88px)] space-y-3 overflow-y-auto rounded-xl border border-border bg-card p-4 shadow-sm">
@@ -554,16 +580,17 @@ function Sidebar({
       <div className="grid grid-cols-2 gap-2">
         <SelectFilter label="Tier" value={filters.tier} options={uniq("commercial_tier")} onChange={(v) => setFilters({ ...filters, tier: v })} />
         <SelectFilter label="Readiness" value={filters.readiness} options={uniq("outreach_readiness_status")} onChange={(v) => setFilters({ ...filters, readiness: v })} />
-        <SelectFilter label="Country" value={filters.country} options={uniq("country")} onChange={(v) => setFilters({ ...filters, country: v })} />
-        <SelectFilter label="Industry" value={filters.industry} options={uniq("industry")} onChange={(v) => setFilters({ ...filters, industry: v })} />
+        <SelectFilter label="Industry group" value={filters.industryGroup} options={industryGroupOptions} onChange={(v) => setFilters({ ...filters, industryGroup: v })} />
+        <SelectFilter label="Employee range" value={filters.employeeRange} options={uniq("employee_range")} onChange={(v) => setFilters({ ...filters, employeeRange: v })} />
       </div>
       <SelectFilter
         label="Source file"
         value={filters.sourceFile}
         options={sourceFiles}
         onChange={(v) => setFilters({ ...filters, sourceFile: v })}
+        muted
       />
-      <div className="flex flex-wrap gap-3 text-xs">
+      <div className="flex flex-wrap gap-x-3 gap-y-1.5 text-xs">
         <label className="flex items-center gap-1.5">
           <input type="checkbox" checked={filters.manualReview} onChange={(e) => setFilters({ ...filters, manualReview: e.target.checked })} />
           Manual review
@@ -573,19 +600,15 @@ function Sidebar({
           Competitor
         </label>
         <label className="flex items-center gap-1.5">
-          <input
-            type="checkbox"
-            checked={filters.hideHighScore}
-            onChange={(e) => setFilters({ ...filters, hideHighScore: e.target.checked })}
-          />
-          Hide high-score records &gt; 9.7
+          <input type="checkbox" checked={filters.hasCallerAngle} onChange={(e) => setFilters({ ...filters, hasCallerAngle: e.target.checked })} />
+          Has caller angle
+        </label>
+        <label className="flex items-center gap-1.5">
+          <input type="checkbox" checked={filters.hasEvidence} onChange={(e) => setFilters({ ...filters, hasEvidence: e.target.checked })} />
+          Has evidence links
         </label>
       </div>
-      {hiddenHighScoreCount > 0 && filters.hideHighScore && (
-        <div className="rounded-md border border-caution/40 bg-caution/10 px-2 py-1.5 text-[11px] text-muted-foreground">
-          {hiddenHighScoreCount} high-score record{hiddenHighScoreCount === 1 ? "" : "s"} hidden
-        </div>
-      )}
+
       <div>
         <span className="mb-1 block text-[11px] font-medium uppercase tracking-wide text-muted-foreground">Sort by</span>
         <div className="flex gap-1 rounded-md border border-border bg-background p-0.5">
@@ -667,6 +690,10 @@ function Sidebar({
 
 function CompanyView({ row, sourceFiles }: { row: Row; sourceFiles: string[] }) {
   const k = val(row, "company_name") + "::" + val(row, "domain", "validated_domain");
+  const companyName = val(row, "company_name");
+  const domain = val(row, "domain", "validated_domain", "canonical_company_domain");
+  const country = val(row, "country");
+  const industry = val(row, "industry");
   return (
     <div key={k} className="space-y-4">
       <CompanyHeader row={row} sourceFiles={sourceFiles} />
@@ -674,6 +701,13 @@ function CompanyView({ row, sourceFiles }: { row: Row; sourceFiles: string[] }) 
       <KeyLinksCard row={row} />
       <HowToContact row={row} />
       <CallStarterCard row={row} />
+      <LushaContacts
+        key={k}
+        companyName={companyName}
+        domain={domain}
+        country={country}
+        industry={industry}
+      />
       <Collapsible title="Advanced">
         <AdvancedDetails row={row} />
       </Collapsible>
